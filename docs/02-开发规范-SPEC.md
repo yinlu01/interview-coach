@@ -317,6 +317,8 @@ CONFIDENCE_FLOOR=0.45          # score 维度门控
 BAND_CONFIDENCE_FLOOR=0.30     # choice 档位门控（四选一置信度天然更低）
 EVAL_RETRY=2
 EVAL_TIMEOUT_S=3
+MAX_FOLLOWUPS=3                # 整场追问上限（实测：模型主动追问会绕过"每题1次"，须在此兜底）
+SHORT_ANSWER_CHARS=15          # 低于此字数在打分卡标注"回答偏短，仅供参考"（不改变计分）
 
 # ASR
 WHISPER_PYTHON=~/.workbuddy/binaries/python/envs/default/bin/python

@@ -54,6 +54,8 @@ JEV_MODEL = os.environ.get("TYPESAFE_MODEL", "~typesafe/jev-latest")
 # 因此两条门控分开设阈值，且都不能照搬"0.6 才算可信"的直觉。
 DIM_FLOOR = float(os.environ.get("CONFIDENCE_FLOOR", "0.45"))          # score 维度门控
 BAND_FLOOR = float(os.environ.get("BAND_CONFIDENCE_FLOOR", "0.30"))    # band 门控，只影响徽章
+MAX_FOLLOWUPS = int(os.environ.get("MAX_FOLLOWUPS", "3"))              # 整场追问上限
+SHORT_ANSWER_CHARS = int(os.environ.get("SHORT_ANSWER_CHARS", "15"))   # 低于此字数标记"回答偏短"
 
 client = httpx.AsyncClient(timeout=60)
 
@@ -107,6 +109,43 @@ def clean_json(text: str) -> str:
     return fence.group(1).strip() if fence else text
 
 
+def _loads(text: str):
+    """安静的 json.loads：失败返回 None，不抛异常。"""
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except Exception:
+        return None
+
+
+def _extract_json(text: str) -> str:
+    """从混杂文本里抠出第一个完整的最外层 JSON 对象（按括号配对，不靠贪婪正则）。"""
+    start = text.find("{")
+    while start != -1:
+        depth, in_str, esc = 0, False, False
+        for i in range(start, len(text)):
+            ch = text[i]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start:i + 1]
+        start = text.find("{", start + 1)
+    return ""
+
+
 async def llm(messages: list[dict], temperature: float = 0.7) -> dict:
     """MiniMax OpenAI 兼容端点。reasoning_split 防止 <think> 混入 content。"""
     extras = {"reasoning_split": True} if "minimaxi.com" in TEXT_BASE else {}
@@ -119,19 +158,40 @@ async def llm(messages: list[dict], temperature: float = 0.7) -> dict:
     )
     r.raise_for_status()
     content = r.json()["choices"][0]["message"]["content"]
-    try:
-        d = json.loads(clean_json(content))
-        if isinstance(d, dict) and d.get("content"):
+    t = clean_json(content).strip()
+
+    # 1) 整段就是合法 JSON 对象 → 直接用。
+    #    注意：不能强制要求某个字段存在——复盘返回的是 {summary/highlights/improvements}，
+    #    没有 content 字段，早期版本因此误判为解析失败、永远走兜底模板。
+    d = _loads(t)
+    if isinstance(d, dict):
+        return d
+
+    # 2) 文本里内嵌了 JSON（模型不遵守 json_object 时）——用括号配对把最外层对象抠出来
+    d = _loads(_extract_json(t))
+    if isinstance(d, dict):
+        return d
+
+    s = t.strip('"')
+
+    # 3) 模型偶尔把示例原样吐出来（还带着 {{ }} 双括号），这时它不是"纯文本问题"，
+    #    直接当题目用会把 JSON 残片显示给用户。先把多余括号收成单层再试一次。
+    if s.startswith("{"):
+        fixed = re.sub(r"^\s*\{+", "{", s)
+        fixed = re.sub(r"\}+\s*$", "}", fixed)
+        d = _loads(fixed)
+        if isinstance(d, dict):
             return d
-        raise ValueError("no content")
-    except Exception:
-        # 实测坑：MiniMax 开 response_format=json_object 仍经常直接输出纯文本问题，
-        # 而且内容质量很好。别浪费这次调用——像问题的纯文本直接包装使用。
-        t = clean_json(content).strip().strip('"')
-        if t and len(t) < 220 and ("？" in t or "?" in t):
-            return {"move": "", "content": t, "hints": [], "raw_text": True}
-        print("[warn] llm 返回无法解析：", content[:300], flush=True)
-        raise ValueError("llm json parse fail")
+        print("[warn] llm 返回 JSON 残片，不作为题目使用：", s[:200], flush=True)
+        raise ValueError("llm returned json fragment")
+
+    # 4) 实测坑：MiniMax 开 response_format=json_object 仍经常直接输出纯文本问题，
+    #    而且内容质量很好。别浪费这次调用——像问题的纯文本直接包装使用。
+    if s and len(s) < 220 and ("？" in s or "?" in s):
+        return {"move": "", "content": s, "hints": [], "raw_text": True}
+
+    print("[warn] llm 返回无法解析：", content[:300], flush=True)
+    raise ValueError("llm json parse fail")
 
 
 def build_messages(s: dict, force_followup: bool = False) -> list[dict]:
@@ -293,6 +353,24 @@ def local_review(dims: list[float], evals: list[dict]) -> dict:
     }
 
 
+async def gen_next(s: dict, force_followup: bool = False, tries: int = 2) -> dict:
+    """出下一题。模型偶尔吐 JSON 残片或空内容，重试一次；仍不行返回 {}，由调用方兜底。"""
+    for i in range(tries):
+        try:
+            out = await asyncio.wait_for(
+                llm(build_messages(s, force_followup=force_followup),
+                    temperature=0.7 if i == 0 else 0.4),
+                timeout=45)
+        except Exception as e:
+            print(f"[warn] 出题第 {i+1} 次失败：", repr(e)[:150], flush=True)
+            continue
+        c = (out.get("content") or "").strip()
+        if c and not c.startswith("{") and len(c) >= 6:
+            return out
+        print(f"[warn] 出题第 {i+1} 次内容不合法：", c[:120], flush=True)
+    return {}
+
+
 async def llm_review(s: dict, evals: list[dict], dims: list[float]) -> dict:
     payload = {
         "interview_type": TAGS[s["type"]],
@@ -305,17 +383,34 @@ async def llm_review(s: dict, evals: list[dict], dims: list[float]) -> dict:
                   for e in evals
                   if not e["is_followup"] and e.get("dims")][:10],   # 收尾题 dims=None，不进复盘
     }
-    try:
-        out = await asyncio.wait_for(
-            llm([{"role": "system", "content": REVIEW_SYSTEM},
-                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
-                temperature=0.4),
-            timeout=45)
-        if not isinstance(out.get("improvements"), list) or not out.get("summary"):
-            raise ValueError("bad review schema")
-        return out
-    except Exception:
-        return local_review(dims, evals)
+    # 复盘是本项目的核心交付物，不能靠模型"这次心情好"。实测 MiniMax 有一定概率
+    # 输出非 JSON，所以给两次机会：第二次降温 + 追加硬约束，仍失败才走本地兜底。
+    last_err = None
+    for attempt in range(2):
+        try:
+            sysmsg = REVIEW_SYSTEM
+            if attempt:
+                sysmsg += ("\n\n【重要】上一次你没有输出合法 JSON。这次只输出一个 JSON 对象，"
+                           "不要 markdown 代码块、不要任何前后说明文字。")
+            out = await asyncio.wait_for(
+                llm([{"role": "system", "content": sysmsg},
+                     {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
+                    temperature=0.4 if attempt == 0 else 0.2),
+                timeout=45)
+            if not isinstance(out.get("improvements"), list) or not out.get("summary"):
+                raise ValueError("bad review schema: " + str(list(out.keys()))[:120])
+            out["_engine"] = "llm"      # 可观测：复盘到底走没走模型
+            if attempt:
+                print(f"[info] 复盘在第 {attempt+1} 次尝试成功", flush=True)
+            return out
+        except Exception as e:
+            last_err = e
+            print(f"[warn] 复盘第 {attempt+1} 次失败：", repr(e)[:200], flush=True)
+
+    print("[warn] 复盘最终走本地兜底：", repr(last_err)[:200], flush=True)
+    r = local_review(dims, evals)
+    r["_engine"] = "local"
+    return r
 
 
 async def build_report(sid: str) -> dict:
@@ -338,6 +433,7 @@ async def build_report(sid: str) -> dict:
            "highlights": review.get("highlights", [])[:3],
            "improvements": (review.get("improvements") or [])[:3],
            "engines": sorted({e["engine"] for e in evals}),
+           "review_engine": review.get("_engine", "local"),
            "cost": round(sum(e.get("cost") or 0 for e in evals), 6)}
     store.save_report(sid, rep)
     store.update_session(sid, status="done")
@@ -366,7 +462,8 @@ async def health():
     return {"ok": True, "llm": TEXT_MODEL, "jev": JEV_MODEL,
             "has_llm_key": bool(TEXT_KEY), "has_jev_key": bool(JEV_KEY),
             # 部署自检：确认进程加载的是磁盘上的最新代码，避免"改了没生效"
-            "build": {"asr_mtime": int(Path(_asr.__file__).stat().st_mtime),
+            "build": {"app_mtime": int(Path(__file__).stat().st_mtime),
+                      "asr_mtime": int(Path(_asr.__file__).stat().st_mtime),
                       "converters": len(_asr._candidates())}}
 
 
@@ -384,12 +481,25 @@ async def create_session(body: CreateIn):
          "history": [], "evals": [], "current": {}}
     SESSIONS[sid] = s
 
-    try:
-        out = await llm(build_messages(s) + [{"role": "user", "content": OPENING}])
-    except Exception:
-        out = {}
-    q = out.get("content") or "先做个自我介绍吧，重点说和这个岗位相关的部分。"
-    hints = out.get("hints") or ["自我介绍", "岗位匹配"]
+    # 开场第一题是整场门面：模型偶尔会吐 JSON 残片或空内容，给两次机会，
+    # 并且只接受"看起来是正常问句"的结果，否则用固定开场题兜底。
+    q, hints = "", []
+    for attempt in range(2):
+        try:
+            out = await asyncio.wait_for(
+                llm(build_messages(s) + [{"role": "user", "content": OPENING}],
+                    temperature=0.7 if attempt == 0 else 0.4),
+                timeout=45)
+        except Exception:
+            out = {}
+        c = (out.get("content") or "").strip()
+        if c and not c.startswith("{") and not c.startswith('"') and len(c) >= 6:
+            q, hints = c, out.get("hints") or []
+            break
+    if not q:
+        q = "先做个自我介绍吧，重点说和这个岗位相关的部分。"
+    if not isinstance(hints, list) or not hints:
+        hints = ["自我介绍", "岗位匹配"]
     greeting = out.get("greeting") or f"你好，我是今天的面试官，这场是{TAGS[body.type]}，一共 {body.total} 个问题，我们开始吧。"
 
     s["current"] = {"content": q, "hints": hints}
@@ -459,17 +569,21 @@ async def answer(sid: str, body: AnswerIn):
     else:
         # 评分与出下一题并行，互不阻塞（SPEC §3）
         ev_task = asyncio.create_task(jev_evaluate(q_text, hints, text))
-        next_task = asyncio.create_task(llm(build_messages(s)))
+        next_task = asyncio.create_task(gen_next(s))
         ev, nxt = await asyncio.gather(ev_task, next_task, return_exceptions=True)
         if isinstance(ev, Exception) or not isinstance(ev, dict) or ev.get("dims") is None:
             ev = fallback_evaluate(text, hints)
-        if isinstance(nxt, Exception):
-            print("[warn] 出题失败，走兜底：", repr(nxt)[:400], flush=True)
+        # gen_next 重试后仍拿不到合法题目时返回 {}，这里一并兜底，绝不把空题目丢给用户
+        if isinstance(nxt, Exception) or not (isinstance(nxt, dict)
+                                              and (nxt.get("content") or "").strip()):
+            print("[warn] 出题失败，走兜底：", repr(nxt)[:240], flush=True)
             nxt = {"move": "next", "content": "好，那换个话题——讲讲你最近做的一个关键决定，当时是怎么取舍的？",
                    "hints": ["决定", "取舍", "结果"]}
 
     ev.update({"qno": qno, "is_followup": is_followup, "question": q_text,
-               "hints": hints, "answer": text})
+               "hints": hints, "answer": text,
+               # 过短的回答即使被打出分数也不可靠，明确告知用户"仅供参考"
+               "too_short": len(text) < SHORT_ANSWER_CHARS})
     s["evals"].append(ev)
     if ev.get("engine") != "skip-closing":
         store.add_evaluation(sid, ev)
@@ -488,12 +602,15 @@ async def answer(sid: str, body: AnswerIn):
             and min(d[0], d[1], d[4]) < 2.4
             and move != "followup"):
         try:
-            nxt = await llm(build_messages(s, force_followup=True))
+            nxt = await gen_next(s, force_followup=True)
             move = nxt.get("move") or "followup"
         except Exception:
             pass
 
-    if move == "followup" and s["followup_used"] < 1 and s["mainQ"] < s["total"] - 1:
+    # 上限必须在这里再判一次：上面那段只在「模型没主动追问」时检查过总数，
+    # 模型自己选 followup 时会绕过限制，导致整场追问失控。
+    if (move == "followup" and s["followup_used"] < 1 and s["mainQ"] < s["total"] - 1
+            and s.get("followups_total", 0) < MAX_FOLLOWUPS):
         s["followup_used"] = 1
         s["awaiting_followup"] = True
         s["followups_total"] = s.get("followups_total", 0) + 1
