@@ -1,0 +1,21 @@
+# 密钥与配置 —— 绝不入库
+.env
+*.env
+!server/.env.example
+
+# 运行时数据（用户简历/回答/录音，隐私数据不出本机）
+data/
+*.db
+*.db-journal
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# macOS
+.DS_Store
+
+# 编辑器
+.vscode/
+.idea/
