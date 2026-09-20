@@ -8,7 +8,7 @@
 存储：SQLite（data/interview.db）—— 会话、消息、评分、报告全部落盘，重启可恢复。
 
 启动：
-  ~/.workbuddy/binaries/python/envs/default/bin/python -m uvicorn app:app --port 8800 --app-dir .
+  ~/.workbuddy/binaries/python/envs/default/bin/python -m uvicorn app:app --port 8821 --app-dir .
 """
 from __future__ import annotations
 

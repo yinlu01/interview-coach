@@ -337,8 +337,8 @@ async function probe(){
   }catch(e){
     LIVE = false;
     $("engineBadge").textContent = "未连接";
-    $("engineDesc").innerHTML = "后端未启动。在项目目录执行：<br>python -m uvicorn app:app --port 8800";
-    $("setupErr").innerHTML = '<div class="err">无法连接后端服务（/api/health）。请先启动：<br><code>cd server &amp;&amp; python -m uvicorn app:app --port 8800</code></div>';
+    $("engineDesc").innerHTML = "后端未启动。在项目目录执行：<br>python -m uvicorn app:app --port 8821";
+    $("setupErr").innerHTML = '<div class="err">无法连接后端服务（/api/health）。请先启动：<br><code>cd server &amp;&amp; python -m uvicorn app:app --port 8821</code></div>';
   }
   $("btnStart").disabled = !LIVE;
   loadHist();

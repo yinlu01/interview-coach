@@ -6,7 +6,7 @@
 # 看起来"改了没生效"。这里改成：杀 → 轮询端口直到真正空闲 → 启动 → 校验 mtime。
 set -euo pipefail
 
-PORT="${PORT:-8800}"
+PORT="${PORT:-8821}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PY="${PYTHON:-/Users/yinlu01/.workbuddy/binaries/python/envs/default/bin/python}"
 LOG="$(cd "$HERE/.." && pwd)/data/server.log"
@@ -14,8 +14,15 @@ LOG="$(cd "$HERE/.." && pwd)/data/server.log"
 mkdir -p "$(dirname "$LOG")"
 
 echo "→ 停止旧进程"
-pkill -f "uvicorn app:app" 2>/dev/null || true
-# 兜底：按端口占用者强杀
+# 只用 pidfile + 本端口定位，绝不 pkill -f "uvicorn app:app"：
+# 别的项目的 uvicorn 也叫 app:app，泛化 pkill 会误杀别人的服务。
+PIDFILE="$(cd "$HERE/.." && pwd)/data/server.pid"
+if [ -f "$PIDFILE" ]; then
+  OLD="$(cat "$PIDFILE" 2>/dev/null || true)"
+  if [ -n "$OLD" ] && kill -0 "$OLD" 2>/dev/null; then kill -9 "$OLD" 2>/dev/null || true; fi
+  rm -f "$PIDFILE"
+fi
+# 兜底：按端口占用者强杀（PORT 已改为本项目专属）
 for i in $(seq 1 15); do
   PID="$(lsof -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | head -1 || true)"
   [ -z "$PID" ] && break
@@ -39,7 +46,11 @@ fi
 
 echo "→ 启动（日志 $LOG）"
 cd "$HERE"
-nohup "$PY" -m uvicorn app:app --host 127.0.0.1 --port "$PORT" > "$LOG" 2>&1 &
+# os.setsid() 脱离当前进程组/会话：否则父 shell 退出时子进程会被一起带走，
+# 表现为"启动成功、health 也过了，但过一会儿端口就没了"。
+nohup "$PY" -c "import os,sys; os.setsid(); os.execvp(sys.executable, [sys.executable,'-m','uvicorn','app:app','--host','127.0.0.1','--port','$PORT'])" > "$LOG" 2>&1 &
+NEWPID=$!
+echo "$NEWPID" > "$PIDFILE"
 disown 2>/dev/null || true
 
 echo "→ 等待就绪并校验代码版本"

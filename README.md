@@ -51,7 +51,7 @@ pip install fastapi uvicorn httpx python-multipart
 # 3. 启动
 cd server
 ./restart.sh          # 一键启动（自动处理端口占用，并校验进程加载的是最新代码）
-open http://127.0.0.1:8800
+open http://127.0.0.1:8821
 ```
 
 浏览器打开后：粘贴简历与 JD（或点「示例填充」）→ 选面试类型 → 开始面试。打字或点麦克风语音回答均可。

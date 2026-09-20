@@ -14,7 +14,7 @@ import time
 import urllib.request
 from pathlib import Path
 
-BASE = "http://127.0.0.1:8800"
+BASE = "http://127.0.0.1:8821"
 STATE = Path(__file__).parent.parent / "data" / "e2e_state.json"
 
 # 绕过本机 HTTP 代理（否则 127.0.0.1 会被代理拦成 502）
