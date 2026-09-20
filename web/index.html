@@ -337,8 +337,8 @@ async function probe(){
   }catch(e){
     LIVE = false;
     $("engineBadge").textContent = "未连接";
-    $("engineDesc").innerHTML = "后端未启动。在项目目录执行：<br>python -m uvicorn app:app --port 8821";
-    $("setupErr").innerHTML = '<div class="err">无法连接后端服务（/api/health）。请先启动：<br><code>cd server &amp;&amp; python -m uvicorn app:app --port 8821</code></div>';
+    $("engineDesc").innerHTML = "后端未启动。在项目目录执行：<br>python -m uvicorn app:app --port 8890";
+    $("setupErr").innerHTML = '<div class="err">无法连接后端服务（/api/health）。请先启动：<br><code>cd server &amp;&amp; python -m uvicorn app:app --port 8890</code></div>';
   }
   $("btnStart").disabled = !LIVE;
   loadHist();
@@ -377,6 +377,12 @@ function esc(t){ return (t||"").replace(/[&<>"]/g, c=>({"&":"&amp;","<":"&lt;","
 
 /* ---------------- 新建会话 ---------------- */
 async function startSession(){
+  // 后端探测失败时别让用户白点：现场再探测一次，仍失败给出明确提示
+  if(!LIVE){ await probe(); }
+  if(!LIVE){
+    $("setupErr").innerHTML = '<div class="err">后端未连接（8890 端口）。请确认服务已启动：<code>cd server &amp;&amp; bash restart.sh</code>，然后刷新本页。</div>';
+    return;
+  }
   const type = window.__type || "technical";
   const total = window.__qty || 8;
   $("btnStart").disabled = true; $("btnStart").textContent = "正在准备第一题…";
@@ -397,6 +403,12 @@ async function startSession(){
 /* ---------------- 会话页 ---------------- */
 function enterSession(greeting, firstQ, qno, isFollowup){
   $("msgs").innerHTML = "";
+  // 开新会话必须重置输入框：恢复旧会话（尤其已结束的）会把 input 置 disabled
+  // 并改占位符为"这场已结束"，不重置的话新会话也像是被锁死（用户实测踩到）。
+  $("input").disabled = false;
+  $("input").placeholder = "说出或输入你的回答…（Enter 发送，Shift+Enter 换行）";
+  $("input").value = "";
+  $("btnSend").disabled = true;
   $("sTag").textContent = TYPES[S.type].name;
   renderDots();
   $("sProg").textContent = `0 / ${S.total}`;
@@ -793,8 +805,14 @@ $("btnSend").addEventListener("click", send);
 (async function boot(){
   await probe();
   const last = localStorage.getItem("ic_last");
+  // 只自动恢复"未答完"的会话；已结束的直接进新建页，
+  // 否则每次打开都跳回旧报告，用户会以为"新建没反应"。
   if(last && LIVE){
-    try{ await openSession(last); return; }catch(e){ localStorage.removeItem("ic_last"); }
+    try{
+      const info = await jget("/api/sessions/" + last);
+      if(info.session.status !== "done"){ await openSession(last); return; }
+    }catch(e){}
+    localStorage.removeItem("ic_last");
   }
   view("setup");
 })();

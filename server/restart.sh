@@ -6,7 +6,7 @@
 # 看起来"改了没生效"。这里改成：杀 → 轮询端口直到真正空闲 → 启动 → 校验 mtime。
 set -euo pipefail
 
-PORT="${PORT:-8821}"
+PORT="${PORT:-8890}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PY="${PYTHON:-/Users/yinlu01/.workbuddy/binaries/python/envs/default/bin/python}"
 LOG="$(cd "$HERE/.." && pwd)/data/server.log"
