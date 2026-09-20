@@ -57,7 +57,10 @@ BAND_FLOOR = float(os.environ.get("BAND_CONFIDENCE_FLOOR", "0.30"))    # band �
 MAX_FOLLOWUPS = int(os.environ.get("MAX_FOLLOWUPS", "3"))              # 整场追问上限
 SHORT_ANSWER_CHARS = int(os.environ.get("SHORT_ANSWER_CHARS", "15"))   # 低于此字数标记"回答偏短"
 
-client = httpx.AsyncClient(timeout=60)
+# trust_env=False：不读 HTTP_PROXY 等环境代理。本机代理（127.0.0.1:59122）时好时坏，
+# 一旦挂掉所有模型请求被代理拦死 → ConnectError，整场面试只剩兜底题（用户实测踩到）。
+# MiniMax 是国内端点本就该直连；OpenRouter 实测直连也可达（2026-09-20 验证）。
+client = httpx.AsyncClient(timeout=60, trust_env=False)
 
 # ---------- 面试官人格 ----------
 PERSONAS = {
@@ -602,13 +605,24 @@ async def answer(sid: str, body: AnswerIn):
             and min(d[0], d[1], d[4]) < 2.4
             and move != "followup"):
         try:
-            nxt = await gen_next(s, force_followup=True)
-            move = nxt.get("move") or "followup"
+            f = await gen_next(s, force_followup=True)
         except Exception:
-            pass
+            f = {}
+        # 关键：gen_next 失败返回 {}（不抛异常），若不检查就把空追问发给前端，
+        # 用户会看到"第 n 题·追问"气泡里空空如也，像卡死（用户实测踩到）。
+        # 失败则放弃这轮追问，沿用刚才兜底出的下一题。
+        if (f.get("content") or "").strip():
+            nxt = f
+            move = f.get("move") or "followup"
 
     # 上限必须在这里再判一次：上面那段只在「模型没主动追问」时检查过总数，
     # 模型自己选 followup 时会绕过限制，导致整场追问失控。
+    # 最后一道保险：任何路径都不允许把空题目/空追问发给前端
+    if not (nxt.get("content") or "").strip():
+        nxt = {"move": "next", "content": "好，我们继续。能再讲讲你最近做的一个关键决定吗？",
+               "hints": ["决定", "理由", "结果"]}
+        if move == "followup":
+            move = "next"
     if (move == "followup" and s["followup_used"] < 1 and s["mainQ"] < s["total"] - 1
             and s.get("followups_total", 0) < MAX_FOLLOWUPS):
         s["followup_used"] = 1
@@ -626,7 +640,17 @@ async def answer(sid: str, body: AnswerIn):
         s["status"] = "closing"
         s["current"] = {"content": "", "hints": []}
     else:
-        s["current"] = {"content": nxt.get("content", ""), "hints": nxt.get("hints", [])}
+        new_q = nxt.get("content", "")
+        # 防复读：实测模型偶尔把上一题/追问原样再问一遍（尤其回答雷同时）。
+        # 与上一条面试官消息一字不差就换固定题，绝不复读。
+        last_q = next((m["content"] for m in reversed(s["history"])
+                       if m["role"] == "interviewer"), "")
+        if new_q.strip() and last_q.strip() and new_q.strip() == last_q.strip():
+            print("[warn] 模型复读上一题，换兜底题", flush=True)
+            new_q = "好，那我们换个角度——聊聊你最近一年最有成就感的一件事，以及它难在哪里？"
+            nxt = {"move": "next", "content": new_q, "hints": ["事件", "难点", "结果"]}
+            move = "next"
+        s["current"] = {"content": new_q, "hints": nxt.get("hints", [])}
         s["history"].append({"role": "interviewer", "content": s["current"]["content"],
                              "kind": kind, "qno": s["mainQ"] + 1})
         store.add_message(sid, "interviewer", s["current"]["content"], kind, s["mainQ"] + 1)
