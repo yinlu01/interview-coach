@@ -496,7 +496,10 @@ async def create_session(body: CreateIn):
          "history": [], "evals": [], "current": {}, "events": [], "seq": 0, "processing": False}
     SESSIONS[sid] = s
 
-    greeting = f"你好，我是今天的面试官，这场是{TAGS[body.type]}，一共 {body.total} 个问题，我们开始吧。"
+    _ROLE = {"technical": "技术面", "hr": "HR 面", "executive": "高管面"}.get(body.type, "模拟")
+    greeting = (f"你好，我是今天的{_ROLE}面试官。本场一共 {body.total} 个问题，"
+                "每答一题，我会从切题、完整、条理、简洁、具体五个维度给你实时评分；"
+                "答得不够展开的地方我会追问。可以打字回答，也可以点输入框旁的麦克风用语音——放轻松，我们开始。")
     s["greeting"] = greeting
     store.add_message(sid, "interviewer", greeting, "greeting", 0)
     persist(s)

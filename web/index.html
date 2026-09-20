@@ -104,6 +104,18 @@
   .me{display:flex;flex-direction:column;align-items:flex-end}
   .me .bubble{background:var(--surface);border:1px solid var(--border);border-radius:14px 14px 4px 14px;padding:13px 16px;max-width:88%;box-shadow:var(--sh);white-space:pre-wrap;line-height:1.7;font-size:14px}
   .sys{text-align:center;font-size:11.5px;color:var(--text-3);padding:4px 0 0}
+  /* 开场白：面试官正式开场气泡（区别于普通问题块） */
+  .opening .q-text{background:var(--accent-soft);border:1px solid var(--accent-line);
+    border-radius:var(--r-md);padding:14px 18px;line-height:1.75;font-size:13.5px}
+  /* 第一题生成期间的"思考中"指示气泡 */
+  .thinking{display:flex;align-items:center;gap:10px;padding:13px 18px;background:var(--surface);
+    border:1px solid var(--border);border-radius:var(--r-md);font-size:13px;color:var(--text-2)}
+  .dots{display:inline-flex;gap:4px;flex:none}
+  .dots i{width:6px;height:6px;border-radius:50%;background:var(--accent);opacity:.25;
+    animation:blink 1.2s infinite}
+  .dots i:nth-child(2){animation-delay:.2s}
+  .dots i:nth-child(3){animation-delay:.4s}
+  @keyframes blink{0%,80%,100%{opacity:.25}40%{opacity:1}}
   .sys span{background:var(--surface-2);border-radius:999px;padding:4px 12px}
 
   .row{display:flex;align-items:flex-start;gap:14px;margin-top:10px;width:100%}
@@ -441,6 +453,7 @@ function handleEvent(e){
     renderMsgs();
   }else if(e.type === "question"){
     S._busy = false; S._waitingQ = false;
+    removeThinking();
     if(e.progress){ S.mainQ = e.progress.mainQ; renderDots(); $("sProg").textContent = `${e.progress.mainQ} / ${e.progress.total}`; }
     setStatus("");
     $("input").disabled = false; $("input").focus();
@@ -467,11 +480,42 @@ function enterSession(greeting){
   $("sProg").textContent = `0 / ${S.total}`;
   t0 = Date.now(); startClock();
   view("session");
-  pushMsg({role:"interviewer", kind:"greeting", content:greeting});
-  // 异步模式：开场题由 /updates 推送，等待期间禁用输入并显示动画
+  typeOpening(greeting);
+  // 异步模式：开场题由 /updates 推送，等待期间禁用输入（指示气泡在开场白打完后出现）
   $("input").disabled = true;
   setStatus("面试官正在准备第一题…", "waiting");
 }
+
+/* 开场白逐字打出 → 打完接"思考中"指示，直到开场题推送到达 */
+function typeOpening(text){
+  const wrap = document.createElement("div");
+  wrap.className = "msg opening";
+  wrap.innerHTML = `<div class="who">面试官 · 开场</div><div class="q-text"></div>`;
+  $("msgs").appendChild(wrap);
+  const target = wrap.querySelector(".q-text");
+  let i = 0;
+  clearInterval(typeTimer);
+  typeTimer = setInterval(()=>{
+    i += 2;
+    target.textContent = text.slice(0, i);
+    $("stream").scrollTop = $("stream").scrollHeight;
+    if(i >= text.length){
+      clearInterval(typeTimer);
+      S._msgs = S._msgs || []; S._msgs.push({role:"interviewer", kind:"greeting", content:text});
+      showThinking("正在阅读你的简历，准备第一题…");
+    }
+  }, 16);
+}
+function showThinking(txt){
+  removeThinking();
+  const el = document.createElement("div");
+  el.className = "msg"; el.id = "thinking";
+  el.innerHTML = `<div class="who">面试官</div>
+    <div class="thinking"><span class="dots"><i></i><i></i><i></i></span><span>${esc(txt)}</span></div>`;
+  $("msgs").appendChild(el);
+  $("stream").scrollTop = $("stream").scrollHeight;
+}
+function removeThinking(){ const el = document.getElementById("thinking"); if(el) el.remove(); }
 
 function startClock(){
   clearInterval(clockTimer);
@@ -494,7 +538,8 @@ function renderMsgs(){
   (S._msgs||[]).forEach((m,i)=>{
     if(m.role === "interviewer"){
       if(m.kind === "greeting"){
-        box.insertAdjacentHTML("beforeend", `<div class="msg sys"><span>${esc(m.content)}</span></div>`);
+        box.insertAdjacentHTML("beforeend",
+          `<div class="msg opening"><div class="who">面试官 · 开场</div><div class="q-text">${esc(m.content)}</div></div>`);
         return;
       }
       const qno = m.qno ? `<span class="qno">第 ${m.qno} 题${m.kind==="followup"?" · 追问":""}</span>` : "";
