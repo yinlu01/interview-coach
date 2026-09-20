@@ -149,6 +149,10 @@
   .send:disabled{background:var(--surface-3);color:var(--text-3);cursor:default}
   .status-line{font-size:11px;color:var(--text-3);max-width:732px;width:100%;padding-left:4px;min-height:16px}
   .status-line.rec{color:var(--weak)}
+  .status-line.waiting{color:var(--indigo,#4B5BD6)}
+  .status-line.waiting::before{content:"";display:inline-block;width:6px;height:6px;border-radius:50%;
+    background:currentColor;margin-right:6px;vertical-align:1px;animation:ic-pulse 1.1s ease-in-out infinite}
+  @keyframes ic-pulse{0%,100%{opacity:.25}50%{opacity:1}}
 
   /* ---------- report ---------- */
   .report{overflow-y:auto;padding:40px 24px 60px}
@@ -300,13 +304,22 @@ let clockTimer = null, t0 = Date.now();
 let mediaRec = null, recChunks = [], recStart = 0;
 
 /* ---------------- API ---------------- */
-async function jget(path){
-  const r = await fetch(path, {cache:"no-store"});
-  if(!r.ok) throw new Error("HTTP " + r.status);
-  return r.json();
+async function jget(path, timeoutMs){
+  return _jfetch("GET", path, null, timeoutMs);
 }
-async function jpost(path, body){
-  const r = await fetch(path, {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)});
+async function jpost(path, body, timeoutMs){
+  return _jfetch("POST", path, JSON.stringify(body), timeoutMs);
+}
+async function _jfetch(method, path, bodyStr, timeoutMs){
+  // 所有请求必须带超时：否则后端万一挂住，界面会永远停在等待态，看起来像卡死
+  const ctl = new AbortController();
+  const t = setTimeout(()=>ctl.abort(), timeoutMs || 150000);
+  let r;
+  try{
+    r = await fetch(path, {method, headers:{"Content-Type":"application/json"}, body: bodyStr, cache:"no-store", signal: ctl.signal});
+  }catch(e){
+    throw new Error(e.name === "AbortError" ? "请求超时，请重试" : "网络请求失败：" + (e.message||""));
+  }finally{ clearTimeout(t); }
   if(!r.ok){
     let msg = "HTTP " + r.status;
     try{ const d = await r.json(); if(d.detail) msg = d.detail; }catch(e){}
@@ -516,7 +529,11 @@ async function send(){
   input.value = ""; input.style.height = "auto"; $("btnSend").disabled = true;
   const msg = {role:"user", content:text, pending:true};
   S._msgs = S._msgs || []; S._msgs.push(msg); renderMsgs();
-  setStatus("面试官正在听…");
+  setStatus("面试官正在评估你的回答并准备下一题…", "waiting");
+  $("statusLine").classList.add("waiting");
+  const slowTimer = setTimeout(()=>{
+    setStatus("模型响应较慢，还在等待…（一般几秒内返回，最多约半分钟）", "waiting");
+  }, 15000);
   try{
     const d = await jpost(`/api/sessions/${S.id}/answer`, {text});
     msg.pending = false; msg.ev = d.evaluation; renderMsgs();
@@ -535,13 +552,16 @@ async function send(){
     setStatus("发送失败：" + e.message);
     toast("发送失败，请重试");
   }finally{
+    clearTimeout(slowTimer);
+    $("statusLine").classList.remove("waiting");
     S._busy = false;
     $("btnSend").disabled = !$("input").value.trim();
     loadHist();
   }
 }
-function setStatus(txt, rec){
-  const el = $("statusLine"); el.textContent = txt || ""; el.className = "status-line" + (rec?" rec":"");
+function setStatus(txt, mode){
+  const el = $("statusLine"); el.textContent = txt || "";
+  el.className = "status-line" + (mode ? " " + mode : "");
 }
 
 /* ---------------- 结束 + 报告 ---------------- */
@@ -747,7 +767,7 @@ async function toggleRec(){
     mediaRec.start();
     recStart = Date.now();
     $("btnMic").classList.add("rec");
-    setStatus("录音中…再点一次结束", true);
+    setStatus("录音中…再点一次结束", "rec");
   }catch(e){
     toast("无法访问麦克风：" + (e.name || e.message));
   }

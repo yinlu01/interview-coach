@@ -60,7 +60,7 @@ SHORT_ANSWER_CHARS = int(os.environ.get("SHORT_ANSWER_CHARS", "15"))   # 低于�
 # trust_env=False：不读 HTTP_PROXY 等环境代理。本机代理（127.0.0.1:59122）时好时坏，
 # 一旦挂掉所有模型请求被代理拦死 → ConnectError，整场面试只剩兜底题（用户实测踩到）。
 # MiniMax 是国内端点本就该直连；OpenRouter 实测直连也可达（2026-09-20 验证）。
-client = httpx.AsyncClient(timeout=60, trust_env=False)
+client = httpx.AsyncClient(timeout=25, trust_env=False)
 
 # ---------- 面试官人格 ----------
 PERSONAS = {
@@ -363,7 +363,7 @@ async def gen_next(s: dict, force_followup: bool = False, tries: int = 2) -> dic
             out = await asyncio.wait_for(
                 llm(build_messages(s, force_followup=force_followup),
                     temperature=0.7 if i == 0 else 0.4),
-                timeout=45)
+                timeout=20)
         except Exception as e:
             print(f"[warn] 出题第 {i+1} 次失败：", repr(e)[:150], flush=True)
             continue
@@ -399,7 +399,7 @@ async def llm_review(s: dict, evals: list[dict], dims: list[float]) -> dict:
                 llm([{"role": "system", "content": sysmsg},
                      {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
                     temperature=0.4 if attempt == 0 else 0.2),
-                timeout=45)
+                timeout=20)
             if not isinstance(out.get("improvements"), list) or not out.get("summary"):
                 raise ValueError("bad review schema: " + str(list(out.keys()))[:120])
             out["_engine"] = "llm"      # 可观测：复盘到底走没走模型
@@ -492,7 +492,7 @@ async def create_session(body: CreateIn):
             out = await asyncio.wait_for(
                 llm(build_messages(s) + [{"role": "user", "content": OPENING}],
                     temperature=0.7 if attempt == 0 else 0.4),
-                timeout=45)
+                timeout=20)
         except Exception:
             out = {}
         c = (out.get("content") or "").strip()
