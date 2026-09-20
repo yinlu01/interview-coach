@@ -85,6 +85,10 @@ def conn() -> sqlite3.Connection:
 def init():
     with conn() as c:
         c.executescript(SCHEMA)
+        # 迁移：reports 表加 review_status（generating/ready/failed/pending）
+        cols = [r[1] for r in c.execute("PRAGMA table_info(reports)")]
+        if "review_status" not in cols:
+            c.execute("ALTER TABLE reports ADD COLUMN review_status TEXT DEFAULT ''")
 
 
 # ---------------- 会话 ----------------
@@ -187,13 +191,14 @@ def save_report(sid: str, rep: dict) -> None:
         c.execute("DELETE FROM reports WHERE session_id=?", (sid,))
         c.execute(
             """INSERT INTO reports(session_id,overall,dims_json,main_count,followup_count,duration_s,
-               summary,highlights_json,improvements_json,engines_json,created_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+               summary,highlights_json,improvements_json,engines_json,review_status,created_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
             (sid, rep["overall"], json.dumps(rep["dims"], ensure_ascii=False),
              rep.get("main_count", 0), rep.get("followup_count", 0), rep.get("duration_s", 0),
              rep.get("summary", ""), json.dumps(rep.get("highlights", []), ensure_ascii=False),
              json.dumps(rep.get("improvements", []), ensure_ascii=False),
-             json.dumps(rep.get("engines", []), ensure_ascii=False), time.time()))
+             json.dumps(rep.get("engines", []), ensure_ascii=False),
+             rep.get("review_status", "ready"), time.time()))
 
 
 def get_report(sid: str) -> dict | None:

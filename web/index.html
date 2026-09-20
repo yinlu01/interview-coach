@@ -116,6 +116,11 @@
   .dots i:nth-child(2){animation-delay:.2s}
   .dots i:nth-child(3){animation-delay:.4s}
   @keyframes blink{0%,80%,100%{opacity:.25}40%{opacity:1}}
+  /* 报告页"AI 复盘生成中/失败"等待卡 */
+  .review-wait{border:1px dashed var(--accent-line);background:var(--accent-soft)}
+  .review-wait p{font-size:13px;line-height:1.8;color:var(--text-2);margin:8px 0 0}
+  .review-wait b{color:var(--text-1)}
+  .rw-head{display:flex;align-items:center;gap:10px;font-size:14px}
   .sys span{background:var(--surface-2);border-radius:999px;padding:4px 12px}
 
   .row{display:flex;align-items:flex-start;gap:14px;margin-top:10px;width:100%}
@@ -345,9 +350,31 @@ function toast(msg){
   clearTimeout(t._t); t._t = setTimeout(()=>t.classList.remove("on"), 2200);
 }
 function view(name){
+  stopReportPoll();                        // 离开报告页即停轮询，回到报告页再启
   $("viewSetup").style.display = name==="setup" ? "" : "none";
   $("viewSession").style.display = name==="session" ? "" : "none";
   $("viewReport").style.display = name==="report" ? "" : "none";
+}
+
+/* 报告页轮询：LLM 复盘后台生成中，每 5s 拉一次，ready/failed 即停 */
+let repTimer = null, repSid = null;
+function stopReportPoll(){ if(repTimer){ clearInterval(repTimer); repTimer = null; } repSid = null; }
+function startReportPoll(sid){
+  stopReportPoll(); repSid = sid;
+  repTimer = setInterval(async ()=>{
+    if(repSid !== sid){ stopReportPoll(); return; }
+    try{
+      const d = await jget(`/api/sessions/${sid}/report`);
+      const st = (d.report||{}).review_status;
+      if(st === "ready" || st === "failed"){
+        stopReportPoll();
+        if($("viewReport").style.display === "" && S && S.id === sid){
+          renderReport(d);
+          if(st === "ready") toast("AI 复盘报告已生成");
+        }
+      }
+    }catch(e){ /* 下轮再试 */ }
+  }, 5000);
 }
 
 /* ---------------- 启动探测 ---------------- */
@@ -647,8 +674,8 @@ async function finish(){
 
 async function showReport(sid){
   const d = await jget(`/api/sessions/${sid}/report`);
+  view("report");          // 先切视图（会清旧轮询），再渲染（生成中会启动新轮询）
   renderReport(d);
-  view("report");
   loadHist();
 }
 
@@ -693,6 +720,22 @@ function renderReport(d){
       <td class="n">${e.dims.map(v=>v.toFixed(1)).join(" · ")}</td>
       <td><span class="band ${e.band}">${BAND_TXT[e.band]||""}</span></td></tr>`).join("");
   const mins = Math.floor((r.duration_s||0)/60), secs = (r.duration_s||0)%60;
+  const rvReady = (r.review_status || "ready") === "ready";
+
+  // LLM 深度复盘（总体判断/亮点/改进建议）按状态渲染：ready 即出、generating 出等待卡、failed 出重试卡
+  const waitCard = rvReady ? "" :
+    r.review_status === "generating" ?
+    `<div class="card panel review-wait">
+       <div class="rw-head"><span class="dots"><i></i><i></i><i></i></span><b>AI 深度复盘中…</b></div>
+       <p>正在结合你每一题的回答，生成总体判断与改进建议，<b>大约需要 1–2 分钟</b>。
+       不用在这里干等——下方<b>总分、维度分析和逐题明细已经就绪</b>，可以先看；
+       也可以离开，稍后在左侧历史里点开这场，生成好后会自动显示。</p></div>` :
+    r.review_status === "failed" ?
+    `<div class="card panel review-wait">
+       <div class="rw-head"><b>复盘没有生成成功</b></div>
+       <p>总分、维度分析和逐题明细不受影响。点下面按钮重新生成，期间可以继续看逐题明细。</p>
+       <button class="btn-primary" id="btnRegen" style="max-width:180px;margin-top:6px">重新生成复盘</button></div>` :
+    `<div class="card panel review-wait"><p>面试结束后将生成 AI 复盘报告。</p></div>`;
 
   $("repBody").innerHTML = `
     <div class="rep-h">
@@ -703,7 +746,9 @@ function renderReport(d){
       </div>
     </div>
 
-    <div class="card panel"><h3>总体判断</h3><div class="summary">${esc(r.summary)}</div></div>
+    ${rvReady
+      ? `<div class="card panel"><h3>总体判断</h3><div class="summary">${esc(r.summary)}</div></div>`
+      : waitCard}
 
     <div class="grid2">
       <div class="card panel radar-wrap"><h3>维度雷达</h3>${radarSVG(dims)}</div>
@@ -713,11 +758,11 @@ function renderReport(d){
           `<div class="dim"><span class="dim-n">${DIM_LABELS[i]}</span>
             <span class="bar"><i style="width:${(v/4*100).toFixed(0)}%"></i></span>
             <span class="dim-v">${v.toFixed(2)}</span></div>`).join("")}</div>
-        ${hl ? `<h3 style="margin-top:18px">做得好的地方</h3>${hl}` : ""}
+        ${rvReady && hl ? `<h3 style="margin-top:18px">做得好的地方</h3>${hl}` : ""}
       </div>
     </div>
 
-    <div class="card panel"><h3>最该改的三件事</h3>${imp || '<div class="imp-i">暂无</div>'}</div>
+    ${rvReady ? `<div class="card panel"><h3>最该改的三件事</h3>${imp || '<div class="imp-i">暂无</div>'}</div>` : ""}
 
     <div class="card panel"><h3>逐题明细</h3>
       <table class="qs"><thead><tr><th>#</th><th>问题 / 我的回答</th><th>五维</th><th>档位</th></tr></thead>
@@ -735,6 +780,17 @@ function renderReport(d){
   $("btnBackSession").onclick = async ()=>{
     try{ await openSession(s.id, true); }catch(e){ toast("无法返回：" + e.message); }
   };
+  const regen = $("btnRegen");
+  if(regen) regen.onclick = async ()=>{
+    regen.disabled = true; regen.textContent = "已开始生成…";
+    try{
+      await jpost(`/api/sessions/${s.id}/report/regenerate`, {});
+      const d2 = await jget(`/api/sessions/${s.id}/report`);
+      renderReport(d2);
+    }catch(e){ toast("重试失败：" + e.message); regen.disabled = false; regen.textContent = "重新生成复盘"; }
+  };
+  // 生成中：轮询 /report，ready 后本页自动补全复盘内容
+  if(r.review_status === "generating") startReportPoll(s.id); else stopReportPoll();
   window.__report = d;
 }
 
@@ -775,7 +831,7 @@ async function openSession(id, forceSession){
     }
   });
   if(!forceSession && d.report){
-    renderReport(d); view("report");
+    view("report"); renderReport(d);   // 先切视图再渲染，保证轮询不被 view() 清掉
   }else if(!forceSession && s.status === "done"){
     await showReport(id);
   }else{

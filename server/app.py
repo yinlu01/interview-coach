@@ -428,28 +428,73 @@ async def llm_review(s: dict, evals: list[dict], dims: list[float]) -> dict:
     return r
 
 
-async def build_report(sid: str) -> dict:
-    s = load_session(sid)
-    if not s:
-        raise HTTPException(404, "session not found")
-    evals = store.list_evaluations(sid)
+def stats_report(s: dict, evals: list[dict]) -> dict:
+    """纯统计报告（总分/维度/逐题数）——全部来自 JEV 已有评分，无需 LLM，毫秒级。"""
     main = [e for e in evals if not e["is_followup"]]
     scored = [e for e in main if not e["low"]] or main
     dims = [_mean([e["dims"][i] for e in scored]) for i in range(5)] if scored else [0.0] * 5
     overall = _mean([dims[0], dims[1], dims[2], dims[4]])
     duration = int(time.time() - s.get("created_at", time.time()))
+    return {"overall": overall, "dims": dims, "main_count": s["mainQ"],
+            "followup_count": sum(1 for e in evals if e["is_followup"]),
+            "duration_s": duration,
+            "unscored": 1 if s["mainQ"] >= s["total"] else 0,   # 收尾反问题不计分
+            "engines": sorted({e["engine"] for e in evals}),
+            "cost": round(sum(e.get("cost") or 0 for e in evals), 6),
+            "review_status": "generating", "summary": "", "highlights": [], "improvements": []}
 
-    review = await llm_review(s, evals, dims)
-    rep = {"overall": overall, "dims": dims, "main_count": s["mainQ"],
-           "followup_count": sum(1 for e in evals if e["is_followup"]),
-           "duration_s": duration,
-           "unscored": 1 if s["mainQ"] >= s["total"] else 0,   # 收尾反问题不计分
-           "summary": review.get("summary", ""),
-           "highlights": review.get("highlights", [])[:3],
-           "improvements": (review.get("improvements") or [])[:3],
-           "engines": sorted({e["engine"] for e in evals}),
-           "review_engine": review.get("_engine", "local"),
-           "cost": round(sum(e.get("cost") or 0 for e in evals), 6)}
+
+_report_jobs: dict[str, asyncio.Task] = {}
+
+
+async def _gen_review(sid: str):
+    """后台 LLM 复盘：完成后把 summary/highlights/improvements 合入报告并置 ready。"""
+    try:
+        s = load_session(sid)
+        if not s:
+            return
+        evals = store.list_evaluations(sid)
+        base = store.get_report(sid) or stats_report(s, evals)
+        review = await llm_review(s, evals, base["dims"])
+        rep = dict(base)
+        rep.update({"summary": review.get("summary", ""),
+                    "highlights": (review.get("highlights") or [])[:3],
+                    "improvements": (review.get("improvements") or [])[:3],
+                    "review_engine": review.get("_engine", "local"),
+                    "review_status": "ready"})
+        store.save_report(sid, rep)
+        print(f"[info] 复盘报告已生成 {sid} engine={review.get('_engine')}", flush=True)
+    except Exception as e:
+        print("[warn] 复盘生成失败：", repr(e)[:200], flush=True)
+        try:
+            base = store.get_report(sid)
+            if base:
+                base["review_status"] = "failed"
+                store.save_report(sid, base)
+        except Exception:
+            pass
+    finally:
+        _report_jobs.pop(sid, None)
+
+
+def _kick_review(sid: str):
+    if not _report_jobs.get(sid) or _report_jobs[sid].done():
+        _report_jobs[sid] = asyncio.create_task(_gen_review(sid))
+
+
+async def build_report(sid: str) -> dict:
+    """兼容旧调用：同步出完整报告（统计+LLM 复盘）。"""
+    s = load_session(sid)
+    if not s:
+        raise HTTPException(404, "session not found")
+    evals = store.list_evaluations(sid)
+    rep = stats_report(s, evals)
+    review = await llm_review(s, evals, rep["dims"])
+    rep.update({"summary": review.get("summary", ""),
+                "highlights": (review.get("highlights") or [])[:3],
+                "improvements": (review.get("improvements") or [])[:3],
+                "review_engine": review.get("_engine", "local"),
+                "review_status": "ready"})
     store.save_report(sid, rep)
     store.update_session(sid, status="done")
     s["status"] = "done"
@@ -728,21 +773,53 @@ async def updates(sid: str, after: int = 0):
 
 @app.post("/api/sessions/{sid}/finish")
 async def finish(sid: str):
+    # 两段式：立即返回纯统计回顾（总分/雷达/维度/逐题明细，全来自 JEV 评分），
+    # LLM 深度复盘（总体判断/亮点/改进建议）转后台任务，完成后前端轮询 /report 拿到 ready。
     s = load_session(sid)
     if not s:
         raise HTTPException(404, "session not found")
-    rep = await build_report(sid)
+    if s.get("status") == "done" and store.get_report(sid):
+        rep = store.get_report(sid)                      # 重复点结束：直接返回已有报告
+    else:
+        rep = stats_report(s, store.list_evaluations(sid))
+        store.save_report(sid, rep)
+        store.update_session(sid, status="done")
+        s["status"] = "done"
+        _kick_review(sid)
     return {"report": rep}
 
 
-@app.get("/api/sessions/{sid}/report")
-async def report(sid: str):
+@app.post("/api/sessions/{sid}/report/regenerate")
+async def regenerate_report(sid: str):
     s = load_session(sid)
     if not s:
         raise HTTPException(404, "session not found")
     rep = store.get_report(sid)
     if not rep:
-        rep = await build_report(sid)
+        rep = stats_report(s, store.list_evaluations(sid))
+        store.save_report(sid, rep)
+    rep["review_status"] = "generating"
+    store.save_report(sid, rep)
+    _kick_review(sid)
+    return {"report": rep}
+
+
+@app.get("/api/sessions/{sid}/report")
+async def report(sid: str):
+    # 永不阻塞：报告记录里 review_status=generating 就直接返回，让前端轮询
+    s = load_session(sid)
+    if not s:
+        raise HTTPException(404, "session not found")
+    rep = store.get_report(sid)
+    if not rep:
+        rep = stats_report(s, store.list_evaluations(sid))
+        if s["status"] == "done":
+            # 面试已结束但没有报告记录（如生成中断/旧数据）——补起后台复盘
+            rep["review_status"] = "generating"
+            store.save_report(sid, rep)
+            _kick_review(sid)
+        else:
+            rep["review_status"] = "pending"
     return {"session": {"id": sid, "type": s["type"], "tag": TAGS[s["type"]], "title": s["title"],
                         "total": s["total"], "mainQ": s["mainQ"], "status": s["status"]},
             "report": rep,
