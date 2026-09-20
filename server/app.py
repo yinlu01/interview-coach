@@ -307,8 +307,20 @@ def load_session(sid: str) -> dict | None:
                      for m in msgs],
          "evals": evals,
          "current": json.loads(row["current_json"] or "{}")}
+    # 事件流（内存态，仅用于前端异步推送；页面刷新走全量恢复，不依赖它）
+    s.setdefault("events", [])
+    s.setdefault("seq", 0)
+    s["processing"] = False
     SESSIONS[sid] = s
     return s
+
+
+def push_event(s: dict, type_: str, **data) -> dict:
+    """向会话追加一条前端事件（评分/下一题/结束），前端通过 /updates 增量拉取。"""
+    s["seq"] = s.get("seq", 0) + 1
+    ev = {"seq": s["seq"], "type": type_, **data}
+    s.setdefault("events", []).append(ev)
+    return ev
 
 
 def persist(s: dict) -> None:
@@ -481,38 +493,43 @@ async def create_session(body: CreateIn):
          "jd": body.jd[:4000], "mainQ": 0, "followup_used": 0, "awaiting_followup": False,
          "followups_total": 0,
          "status": "active", "title": make_title(body.type, body.jd), "created_at": time.time(),
-         "history": [], "evals": [], "current": {}}
+         "history": [], "evals": [], "current": {}, "events": [], "seq": 0, "processing": False}
     SESSIONS[sid] = s
 
-    # 开场第一题是整场门面：模型偶尔会吐 JSON 残片或空内容，给两次机会，
-    # 并且只接受"看起来是正常问句"的结果，否则用固定开场题兜底。
-    q, hints = "", []
-    for attempt in range(2):
-        try:
-            out = await asyncio.wait_for(
-                llm(build_messages(s) + [{"role": "user", "content": OPENING}],
-                    temperature=0.7 if attempt == 0 else 0.4),
-                timeout=20)
-        except Exception:
-            out = {}
-        c = (out.get("content") or "").strip()
-        if c and not c.startswith("{") and not c.startswith('"') and len(c) >= 6:
-            q, hints = c, out.get("hints") or []
-            break
-    if not q:
-        q = "先做个自我介绍吧，重点说和这个岗位相关的部分。"
-    if not isinstance(hints, list) or not hints:
-        hints = ["自我介绍", "岗位匹配"]
-    greeting = out.get("greeting") or f"你好，我是今天的面试官，这场是{TAGS[body.type]}，一共 {body.total} 个问题，我们开始吧。"
-
-    s["current"] = {"content": q, "hints": hints}
+    greeting = f"你好，我是今天的面试官，这场是{TAGS[body.type]}，一共 {body.total} 个问题，我们开始吧。"
     s["greeting"] = greeting
-    s["history"].append({"role": "interviewer", "content": q, "kind": "question", "qno": 1})
     store.add_message(sid, "interviewer", greeting, "greeting", 0)
-    store.add_message(sid, "interviewer", q, "question", 1)
     persist(s)
-    return {"id": sid, "greeting": greeting, "question": {"content": q, "hints": hints},
-            "qno": 1, "total": s["total"], "title": s["title"]}
+
+    # 异步化：接口立即返回，开场题后台生成后经 /updates 推送。
+    # 体验问题：开场题要等模型 2~9s，同步返回会让"开始面试"按钮转半天。
+    async def _gen_opening():
+        q, hints = "", []
+        for attempt in range(2):   # 开场题是整场门面：残片/空内容重试一次
+            try:
+                out = await asyncio.wait_for(
+                    llm(build_messages(s) + [{"role": "user", "content": OPENING}],
+                        temperature=0.7 if attempt == 0 else 0.4),
+                    timeout=20)
+            except Exception:
+                out = {}
+            c = (out.get("content") or "").strip()
+            if c and not c.startswith("{") and not c.startswith('"') and len(c) >= 6:
+                q, hints = c, out.get("hints") or []
+                break
+        if not q:
+            q = "先做个自我介绍吧，重点说和这个岗位相关的部分。"
+        if not isinstance(hints, list) or not hints:
+            hints = ["自我介绍", "岗位匹配"]
+        s["current"] = {"content": q, "hints": hints}
+        s["history"].append({"role": "interviewer", "content": q, "kind": "question", "qno": 1})
+        store.add_message(sid, "interviewer", q, "question", 1)
+        persist(s)
+        push_event(s, "question", kind="question", content=q, hints=hints, qno=1)
+
+    asyncio.create_task(_gen_opening())
+    return {"id": sid, "greeting": greeting, "qno": 0,
+            "total": s["total"], "title": s["title"], "seq": s["seq"]}
 
 
 @app.get("/api/sessions")
@@ -549,116 +566,160 @@ async def delete_session_api(sid: str):
 
 @app.post("/api/sessions/{sid}/answer")
 async def answer(sid: str, body: AnswerIn):
+    """异步化：立即入库回答并返回 ack；评分+出题后台跑，结果经 /updates 推送。
+    用户不再对着屏幕干等 2~10 秒。"""
     s = load_session(sid)
     if not s:
         raise HTTPException(404, "session not found")
     if s.get("status") == "done":
         raise HTTPException(400, "session already finished")
+    if s.get("processing"):
+        raise HTTPException(409, "上一条回答还在处理中，请等下一题出现")
     text = body.text.strip()
     s["history"].append({"role": "user", "content": text})
-    is_followup = s["awaiting_followup"]
     qno = s["mainQ"] + 1
     store.add_message(sid, "user", text, "answer", qno)
+    s["processing"] = True
+    asyncio.create_task(_process_answer(s, text))
+    return {"ok": True, "qno": qno, "seq": s.get("seq", 0)}
 
-    q_text = s["current"].get("content", "")
-    hints = s["current"].get("hints", [])
-    is_closing = qno >= s["total"]          # 最后一题是收尾反问，不该按答题量规打分
 
-    if is_closing:
-        # 收尾反问不计分，也不需要再出下一题
-        ev = {"engine": "skip-closing", "dims": None, "band": "", "confidence": 0,
-              "band_confidence": 0, "low": False, "band_low": False}
-        nxt = {"move": "next", "content": "", "hints": []}
-    else:
-        # 评分与出下一题并行，互不阻塞（SPEC §3）
-        ev_task = asyncio.create_task(jev_evaluate(q_text, hints, text))
-        next_task = asyncio.create_task(gen_next(s))
-        ev, nxt = await asyncio.gather(ev_task, next_task, return_exceptions=True)
-        if isinstance(ev, Exception) or not isinstance(ev, dict) or ev.get("dims") is None:
-            ev = fallback_evaluate(text, hints)
-        # gen_next 重试后仍拿不到合法题目时返回 {}，这里一并兜底，绝不把空题目丢给用户
-        if isinstance(nxt, Exception) or not (isinstance(nxt, dict)
-                                              and (nxt.get("content") or "").strip()):
-            print("[warn] 出题失败，走兜底：", repr(nxt)[:240], flush=True)
-            nxt = {"move": "next", "content": "好，那换个话题——讲讲你最近做的一个关键决定，当时是怎么取舍的？",
-                   "hints": ["决定", "取舍", "结果"]}
+async def _process_answer(s: dict, text: str):
+    sid = s["id"]
+    try:
+        is_followup = s["awaiting_followup"]
+        qno = s["mainQ"] + 1
+        q_text = s["current"].get("content", "")
+        hints = s["current"].get("hints", [])
+        is_closing = qno >= s["total"]      # 最后一题是收尾反问，不该按答题量规打分
 
-    ev.update({"qno": qno, "is_followup": is_followup, "question": q_text,
-               "hints": hints, "answer": text,
-               # 过短的回答即使被打出分数也不可靠，明确告知用户"仅供参考"
-               "too_short": len(text) < SHORT_ANSWER_CHARS})
-    s["evals"].append(ev)
-    if ev.get("engine") != "skip-closing":
-        store.add_evaluation(sid, ev)
+        if is_closing:
+            # 收尾反问不计分，也不需要再出下一题
+            ev = {"engine": "skip-closing", "dims": None, "band": "", "confidence": 0,
+                  "band_confidence": 0, "low": False, "band_low": False}
+            nxt = {"move": "next", "content": "", "hints": []}
+        else:
+            # 评分与出下一题并行，互不阻塞（SPEC §3）
+            ev_task = asyncio.create_task(jev_evaluate(q_text, hints, text))
+            next_task = asyncio.create_task(gen_next(s))
+            ev, nxt = await asyncio.gather(ev_task, next_task, return_exceptions=True)
+            if isinstance(ev, Exception) or not isinstance(ev, dict) or ev.get("dims") is None:
+                ev = fallback_evaluate(text, hints)
+            # gen_next 重试后仍拿不到合法题目时返回 {}，这里一并兜底，绝不把空题目丢给用户
+            if isinstance(nxt, Exception) or not (isinstance(nxt, dict)
+                                                  and (nxt.get("content") or "").strip()):
+                print("[warn] 出题失败，走兜底：", repr(nxt)[:240], flush=True)
+                nxt = {"move": "next", "content": "好，那换个话题——讲讲你最近做的一个关键决定，当时是怎么取舍的？",
+                       "hints": ["决定", "取舍", "结果"]}
 
-    if isinstance(nxt, Exception):
-        nxt = {"move": "next", "content": "好，我们下一题。能再讲讲你最近做的一个决定吗？",
-               "hints": ["决定", "理由", "结果"]}
-    move = nxt.get("move") or "next"
+        ev.update({"qno": qno, "is_followup": is_followup, "question": q_text,
+                   "hints": hints, "answer": text,
+                   # 过短的回答即使被打出分数也不可靠，明确告知用户"仅供参考"
+                   "too_short": len(text) < SHORT_ANSWER_CHARS})
+        s["evals"].append(ev)
+        if ev.get("engine") != "skip-closing":
+            store.add_evaluation(sid, ev)
+        # 评分先推：前端可以先把打分卡亮出来，不用等下一题
+        push_event(s, "evaluation", evaluation=ev)
 
-    # 后端确定性兜底：实测 MiniMax 几乎从不主动选 followup（整场 0 次追问）。
-    # 所以由 JEV 分数来裁决——切题/完整/具体任一维度过低，就强制补一轮追问。
-    d = ev.get("dims")
-    if (d and not is_closing and s["followup_used"] < 1
-            and s["mainQ"] < s["total"] - 1
-            and s.get("followups_total", 0) < 3
-            and min(d[0], d[1], d[4]) < 2.4
-            and move != "followup"):
+        if isinstance(nxt, Exception):
+            nxt = {"move": "next", "content": "好，我们下一题。能再讲讲你最近做的一个决定吗？",
+                   "hints": ["决定", "理由", "结果"]}
+        move = nxt.get("move") or "next"
+
+        # 后端确定性兜底：实测 MiniMax 几乎从不主动选 followup（整场 0 次追问）。
+        # 所以由 JEV 分数来裁决——切题/完整/具体任一维度过低，就强制补一轮追问。
+        d = ev.get("dims")
+        if (d and not is_closing and s["followup_used"] < 1
+                and s["mainQ"] < s["total"] - 1
+                and s.get("followups_total", 0) < 3
+                and min(d[0], d[1], d[4]) < 2.4
+                and move != "followup"):
+            try:
+                f = await gen_next(s, force_followup=True)
+            except Exception:
+                f = {}
+            # 关键：gen_next 失败返回 {}（不抛异常），若不检查就把空追问发给前端，
+            # 用户会看到"第 n 题·追问"气泡里空空如也，像卡死（用户实测踩到）。
+            # 失败则放弃这轮追问，沿用刚才兜底出的下一题。
+            if (f.get("content") or "").strip():
+                nxt = f
+                move = f.get("move") or "followup"
+
+        # 上限必须在这里再判一次：上面那段只在「模型没主动追问」时检查过总数，
+        # 模型自己选 followup 时会绕过限制，导致整场追问失控。
+        # 最后一道保险：任何路径都不允许把空题目/空追问发给前端
+        if not (nxt.get("content") or "").strip():
+            nxt = {"move": "next", "content": "好，我们继续。能再讲讲你最近做的一个关键决定吗？",
+                   "hints": ["决定", "理由", "结果"]}
+            if move == "followup":
+                move = "next"
+        if (move == "followup" and s["followup_used"] < 1 and s["mainQ"] < s["total"] - 1
+                and s.get("followups_total", 0) < MAX_FOLLOWUPS):
+            s["followup_used"] = 1
+            s["awaiting_followup"] = True
+            s["followups_total"] = s.get("followups_total", 0) + 1
+            kind = "followup"
+        else:
+            s["mainQ"] += 1
+            s["followup_used"] = 0
+            s["awaiting_followup"] = False
+            kind = "closing" if s["mainQ"] >= s["total"] else "next"
+
+        if s["mainQ"] >= s["total"]:          # 题量用尽，不再出新题
+            kind = "done"
+            s["status"] = "closing"
+            s["current"] = {"content": "", "hints": []}
+        else:
+            new_q = nxt.get("content", "")
+            # 防复读：实测模型偶尔把上一题/追问原样再问一遍（尤其回答雷同时）。
+            # 与上一条面试官消息一字不差就换固定题，绝不复读。
+            last_q = next((m["content"] for m in reversed(s["history"])
+                           if m["role"] == "interviewer"), "")
+            if new_q.strip() and last_q.strip() and new_q.strip() == last_q.strip():
+                print("[warn] 模型复读上一题，换兜底题", flush=True)
+                new_q = "好，那我们换个角度——聊聊你最近一年最有成就感的一件事，以及它难在哪里？"
+                nxt = {"move": "next", "content": new_q, "hints": ["事件", "难点", "结果"]}
+                move = "next"
+            s["current"] = {"content": new_q, "hints": nxt.get("hints", [])}
+            s["history"].append({"role": "interviewer", "content": s["current"]["content"],
+                                 "kind": kind, "qno": s["mainQ"] + 1})
+            store.add_message(sid, "interviewer", s["current"]["content"], kind, s["mainQ"] + 1)
+        persist(s)
+
+        # 推送下一题/结束事件
+        if kind == "done":
+            push_event(s, "done", progress={"mainQ": s["mainQ"], "total": s["total"]})
+        else:
+            push_event(s, "question", kind=kind, content=s["current"]["content"],
+                       hints=s["current"]["hints"], qno=min(s["mainQ"] + 1, s["total"]),
+                       progress={"mainQ": s["mainQ"], "total": s["total"]})
+    except Exception as e:
+        # 任何异常都不能让会话卡死：兜底评分+兜底题必须推出去
+        print("[error] 处理回答异常：", repr(e)[:300], flush=True)
         try:
-            f = await gen_next(s, force_followup=True)
-        except Exception:
-            f = {}
-        # 关键：gen_next 失败返回 {}（不抛异常），若不检查就把空追问发给前端，
-        # 用户会看到"第 n 题·追问"气泡里空空如也，像卡死（用户实测踩到）。
-        # 失败则放弃这轮追问，沿用刚才兜底出的下一题。
-        if (f.get("content") or "").strip():
-            nxt = f
-            move = f.get("move") or "followup"
+            ev = fallback_evaluate(text, [])
+            ev.update({"qno": s["mainQ"] + 1, "is_followup": s["awaiting_followup"],
+                       "answer": text, "too_short": len(text) < SHORT_ANSWER_CHARS})
+            push_event(s, "evaluation", evaluation=ev)
+            push_event(s, "question", kind="next",
+                       content="好，我们继续。能再讲讲你最近做的一个关键决定吗？",
+                       hints=["决定", "理由", "结果"], qno=min(s["mainQ"] + 2, s["total"]))
+        except Exception as e2:
+            print("[error] 兜底推送也失败：", repr(e2)[:200], flush=True)
+    finally:
+        s["processing"] = False
 
-    # 上限必须在这里再判一次：上面那段只在「模型没主动追问」时检查过总数，
-    # 模型自己选 followup 时会绕过限制，导致整场追问失控。
-    # 最后一道保险：任何路径都不允许把空题目/空追问发给前端
-    if not (nxt.get("content") or "").strip():
-        nxt = {"move": "next", "content": "好，我们继续。能再讲讲你最近做的一个关键决定吗？",
-               "hints": ["决定", "理由", "结果"]}
-        if move == "followup":
-            move = "next"
-    if (move == "followup" and s["followup_used"] < 1 and s["mainQ"] < s["total"] - 1
-            and s.get("followups_total", 0) < MAX_FOLLOWUPS):
-        s["followup_used"] = 1
-        s["awaiting_followup"] = True
-        s["followups_total"] = s.get("followups_total", 0) + 1
-        kind = "followup"
-    else:
-        s["mainQ"] += 1
-        s["followup_used"] = 0
-        s["awaiting_followup"] = False
-        kind = "closing" if s["mainQ"] >= s["total"] else "next"
 
-    if s["mainQ"] >= s["total"]:          # 题量用尽，不再出新题
-        kind = "done"
-        s["status"] = "closing"
-        s["current"] = {"content": "", "hints": []}
-    else:
-        new_q = nxt.get("content", "")
-        # 防复读：实测模型偶尔把上一题/追问原样再问一遍（尤其回答雷同时）。
-        # 与上一条面试官消息一字不差就换固定题，绝不复读。
-        last_q = next((m["content"] for m in reversed(s["history"])
-                       if m["role"] == "interviewer"), "")
-        if new_q.strip() and last_q.strip() and new_q.strip() == last_q.strip():
-            print("[warn] 模型复读上一题，换兜底题", flush=True)
-            new_q = "好，那我们换个角度——聊聊你最近一年最有成就感的一件事，以及它难在哪里？"
-            nxt = {"move": "next", "content": new_q, "hints": ["事件", "难点", "结果"]}
-            move = "next"
-        s["current"] = {"content": new_q, "hints": nxt.get("hints", [])}
-        s["history"].append({"role": "interviewer", "content": s["current"]["content"],
-                             "kind": kind, "qno": s["mainQ"] + 1})
-        store.add_message(sid, "interviewer", s["current"]["content"], kind, s["mainQ"] + 1)
-    persist(s)
-
-    return {"evaluation": ev,
-            "next": {"kind": kind, "content": s["current"]["content"],
-                     "hints": s["current"]["hints"], "qno": min(s["mainQ"] + 1, s["total"])},
+@app.get("/api/sessions/{sid}/updates")
+async def updates(sid: str, after: int = 0):
+    """前端轮询：增量拉取评分/下一题/结束事件。轻量、无阻塞。"""
+    s = load_session(sid)
+    if not s:
+        raise HTTPException(404, "session not found")
+    events = [e for e in s.get("events", []) if e["seq"] > after]
+    return {"seq": s.get("seq", 0), "events": events,
+            "status": s.get("status"), "processing": s.get("processing", False),
             "progress": {"mainQ": s["mainQ"], "total": s["total"]}}
 
 

@@ -302,6 +302,7 @@ let LIVE = false;
 let S = null;            // 当前会话（内存态）
 let clockTimer = null, t0 = Date.now();
 let mediaRec = null, recChunks = [], recStart = 0;
+let pollTimer = null;    // /updates 轮询句柄
 
 /* ---------------- API ---------------- */
 async function jget(path, timeoutMs){
@@ -388,7 +389,7 @@ async function loadHist(){
 }
 function esc(t){ return (t||"").replace(/[&<>"]/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
 
-/* ---------------- 新建会话 ---------------- */
+/* ---------------- 新建会话（异步：立即进入对话页，开场题后台推送） ---------------- */
 async function startSession(){
   // 后端探测失败时别让用户白点：现场再探测一次，仍失败给出明确提示
   if(!LIVE){ await probe(); }
@@ -398,27 +399,66 @@ async function startSession(){
   }
   const type = window.__type || "technical";
   const total = window.__qty || 8;
-  $("btnStart").disabled = true; $("btnStart").textContent = "正在准备第一题…";
+  $("btnStart").disabled = true; $("btnStart").textContent = "正在创建…";
   $("setupErr").innerHTML = "";
   try{
     const d = await jpost("/api/sessions", {type, total,
       resume: $("resumeText").value.trim(), jd: $("jdText").value.trim()});
-    S = {id:d.id, type, total, mainQ:0, title:d.title, evals:[], awaitingFollowup:false};
+    S = {id:d.id, type, total, mainQ:0, title:d.title, evals:[], awaitingFollowup:false,
+         seq:d.seq||0, _busy:true, _waitingQ:true, _msgs:[]};
     localStorage.setItem("ic_last", d.id);
-    enterSession(d.greeting, d.question.content, 1, false);
+    enterSession(d.greeting);
+    startPoll();
   }catch(e){
     $("setupErr").innerHTML = '<div class="err">创建失败：' + esc(e.message) + '</div>';
-  }finally{
     $("btnStart").disabled = false; $("btnStart").textContent = "开始面试";
   }
 }
 
+/* ---------------- 事件轮询（评分/下一题/结束都从这里来） ---------------- */
+function startPoll(){
+  if(pollTimer) clearTimeout(pollTimer);
+  pollTimer = setTimeout(pollLoop, 1000);
+}
+async function pollLoop(){
+  if(!S || !LIVE) return;
+  const sid = S.id;
+  try{
+    const d = await jget(`/api/sessions/${sid}/updates?after=${S.seq||0}`, 20000);
+    if(!S || S.id !== sid) return;          // 期间切换了会话，丢弃
+    S.seq = d.seq || S.seq || 0;
+    (d.events||[]).forEach(handleEvent);
+  }catch(e){ /* 单次轮询失败静默，下一轮再试 */ }
+  if(S && S.id === sid) pollTimer = setTimeout(pollLoop, 1200);
+}
+function handleEvent(e){
+  if(e.type === "evaluation" && S._msgs){
+    // 评分先到先亮卡：挂到最后一条还没有评分的用户气泡上
+    for(let i = S._msgs.length-1; i >= 0; i--){
+      const m = S._msgs[i];
+      if(m.role === "user" && !m.ev){ m.ev = e.evaluation; m.pending = false; break; }
+    }
+    renderMsgs();
+  }else if(e.type === "question"){
+    S._busy = false; S._waitingQ = false;
+    if(e.progress){ S.mainQ = e.progress.mainQ; renderDots(); $("sProg").textContent = `${e.progress.mainQ} / ${e.progress.total}`; }
+    setStatus("");
+    $("input").disabled = false; $("input").focus();
+    typeOut(e.content, e.qno, e.kind === "followup" ? "followup" : "question");
+    loadHist();
+  }else if(e.type === "done"){
+    S._busy = false; S._waitingQ = false;
+    if(e.progress){ S.mainQ = e.progress.mainQ; }
+    setStatus("题目已全部问完，正在生成复盘报告…", "waiting");
+    finish();
+  }
+}
+
 /* ---------------- 会话页 ---------------- */
-function enterSession(greeting, firstQ, qno, isFollowup){
+function enterSession(greeting){
   $("msgs").innerHTML = "";
   // 开新会话必须重置输入框：恢复旧会话（尤其已结束的）会把 input 置 disabled
   // 并改占位符为"这场已结束"，不重置的话新会话也像是被锁死（用户实测踩到）。
-  $("input").disabled = false;
   $("input").placeholder = "说出或输入你的回答…（Enter 发送，Shift+Enter 换行）";
   $("input").value = "";
   $("btnSend").disabled = true;
@@ -428,9 +468,9 @@ function enterSession(greeting, firstQ, qno, isFollowup){
   t0 = Date.now(); startClock();
   view("session");
   pushMsg({role:"interviewer", kind:"greeting", content:greeting});
-  setTimeout(()=>typeOut(firstQ, qno, isFollowup?"followup":"question"), 260);
-  $("input").focus();
-  loadHist();
+  // 异步模式：开场题由 /updates 推送，等待期间禁用输入并显示动画
+  $("input").disabled = true;
+  setStatus("面试官正在准备第一题…", "waiting");
 }
 
 function startClock(){
@@ -519,44 +559,27 @@ function scoreCard(ev){
   </div>`;
 }
 
-/* ---------------- 发送回答 ---------------- */
+/* ---------------- 发送回答（异步 ack，评分/下一题由轮询推送） ---------------- */
 async function send(){
   const input = $("input");
   const text = input.value.trim();
-  if(!text || !S || S._busy) return;
+  if(!text || !S || S._busy || S._waitingQ) return;
   if(S.finished){ toast("这场已结束，可在左侧历史里回看报告"); return; }
   S._busy = true;
   input.value = ""; input.style.height = "auto"; $("btnSend").disabled = true;
   const msg = {role:"user", content:text, pending:true};
   S._msgs = S._msgs || []; S._msgs.push(msg); renderMsgs();
-  setStatus("面试官正在评估你的回答并准备下一题…", "waiting");
-  $("statusLine").classList.add("waiting");
-  const slowTimer = setTimeout(()=>{
-    setStatus("模型响应较慢，还在等待…（一般几秒内返回，最多约半分钟）", "waiting");
-  }, 15000);
   try{
-    const d = await jpost(`/api/sessions/${S.id}/answer`, {text});
-    msg.pending = false; msg.ev = d.evaluation; renderMsgs();
-    S.mainQ = d.progress.mainQ;
-    S.awaitingFollowup = d.next.kind === "followup";
-    renderDots(); $("sProg").textContent = `${d.progress.mainQ} / ${d.progress.total}`;
-    if(d.next.kind === "done"){
-      setStatus("题目已全部问完，正在生成复盘报告…");
-      await finish();
-    }else{
-      setStatus("");
-      typeOut(d.next.content, d.next.qno, d.next.kind === "followup" ? "followup" : "question");
-    }
+    await jpost(`/api/sessions/${S.id}/answer`, {text}, 30000);
+    // ack 即返回：气泡立刻解冻，评分和下一题由 /updates 推送（handleEvent）
+    S._waitingQ = true;
+    $("input").disabled = true;
+    setStatus("面试官正在评估你的回答并准备下一题…", "waiting");
   }catch(e){
     msg.pending = false; renderMsgs();
+    S._busy = false;
     setStatus("发送失败：" + e.message);
     toast("发送失败，请重试");
-  }finally{
-    clearTimeout(slowTimer);
-    $("statusLine").classList.remove("waiting");
-    S._busy = false;
-    $("btnSend").disabled = !$("input").value.trim();
-    loadHist();
   }
 }
 function setStatus(txt, mode){
@@ -724,6 +747,12 @@ async function openSession(id, forceSession){
       setStatus("题目已问完，点右上角生成报告");
     }
     loadHist();
+    // 恢复后接入事件流：seq 以服务端当前值为基线，历史事件不重放
+    try{
+      const u = await jget(`/api/sessions/${id}/updates?after=0`, 20000);
+      S.seq = u.seq || 0;
+    }catch(e){ S.seq = 0; }
+    startPoll();
   }
 }
 
